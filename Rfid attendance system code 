@@ -1,0 +1,195 @@
+/*
+ * ============================================================================
+ * FILE        : rfid_attendance_system.ino
+ * PROJECT     : MFRC522 Contactless RFID Attendance System (Check-In/Check-Out)
+ * AUTHOR      : Kenji Male (@kenjimale)
+ * REPOSITORY  : https://github.com/kenjimale/rfid-attendance-system
+ * 
+ * ----------------------------------------------------------------------------
+ * CREDITS, LIBRARIES & INSPIRATIONS USED IN THIS CODE:
+ * ----------------------------------------------------------------------------
+ * 1. MFRC522 Library (<MFRC522.h>)
+ *    - Author: Miguel Balboa & the Arduino GithubCommunity
+ *    - Repo: https://github.com/miguelbalboa/rfid
+ *    - License: Unlicense / Public Domain
+ *    - Usage: Powers `PCD_Init()`, `PICC_IsNewCardPresent()`, `PICC_ReadCardSerial()`,
+ *             `PICC_HaltA()`, and `PCD_StopCrypto1()`.
+ *
+ * 2. Arduino SPI Core Library (<SPI.h>)
+ *    - Author: Arduino Core Team / Paul Stoffregen
+ *    - License: LGPLv2.1
+ *    - Usage: Handles high-speed synchronous serial communication between the 
+ *             microcontroller and the RC522 module.
+ *
+ * 3. UID Byte-to-Hex String Parsing & Access Control Logic
+ *    - Inspired by: Rui & Sara Santos (Random Nerd Tutorials), Dejan Nedelkovski
+ *      (How To Mechatronics), and Last Minute Engineers.
+ *    - Usage: Byte array iteration and zero-padded hexadecimal formatting for
+ *             comparing scanned tags against an authorized lookup table.
+ *
+ * 4. Non-Blocking Cooldown Timer (`millis()` Anti-Passback)
+ *    - Inspired by: Arduino Official "BlinkWithoutDelay" (David A. Mellis) & 
+ *      Nick Gammon's state-machine timing guides.
+ *    - Usage: Prevents duplicate rapid scans without freezing the main loop.
+ *
+ * 5. Hardware & Protocol Reference
+ *    - NXP Semiconductors MFRC522 Standard Performance MIFARE and NTAG Frontend
+ *      Datasheet (ISO/IEC 14443A / 13.56 MHz).
+ * ============================================================================
+ */
+
+#include <SPI.h>
+#include <MFRC522.h>
+
+// --- Pin Definitions (Arduino Uno / Nano) ---
+#define SS_PIN    10  // SPI Slave Select (SDA on RC522)
+#define RST_PIN   9   // Reset Pin
+#define BUZZER    8   // Piezo Buzzer (+)
+#define LED_GREEN 7   // Authorized Indicator LED
+#define LED_RED   6   // Unauthorized Indicator LED
+
+// Initialize MFRC522 instance (from miguelbalboa/rfid)
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// --- Attendance Database Structure ---
+struct User {
+  const char* uid;
+  const char* name;
+  const char* idNumber;
+  bool isCheckedIn; // Tracks Check-In (true) vs Check-Out (false)
+};
+
+// Enrolled Users (Replace UIDs with your own cards)
+User database[] = {
+  {"A3 5B 2C 19", "Kenji Male",   "EMP-001", false},
+  {"F4 12 8A 02", "Alex Mercer",  "EMP-002", false},
+  {"6D 89 33 B1", "Sarah Connor", "EMP-003", false}
+};
+const int totalUsers = sizeof(database) / sizeof(database[0]);
+
+// --- Anti-Spam Cooldown Variables ---
+String lastScannedUID = "";
+unsigned long lastScanTime = 0;
+const unsigned long scanCooldown = 3500; // 3.5 seconds between scans of the same card
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial); // Wait for Serial port (needed for Leonardo/Pro Micro/ESP32)
+
+  SPI.begin();      // Initialize SPI bus
+  rfid.PCD_Init();  // Initialize MFRC522 hardware registers
+  delay(4);
+
+  pinMode(BUZZER, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  Serial.println(F("================================================"));
+  Serial.println(F("   RFID ATTENDANCE SYSTEM INITIALIZED"));
+  Serial.println(F("   Author: Kenji Male (@kenjimale)"));
+  Serial.println(F("================================================"));
+  rfid.PCD_DumpVersionToSerial(); // Verify SPI connection to RC522 chip
+  Serial.println(F("CSV_HEADER: UID,Name,ID,Action,Result"));
+  Serial.println(F("Waiting for RFID card tap..."));
+  Serial.println();
+}
+
+void loop() {
+  // 1. Poll for new ISO/IEC 14443A card presence (miguelbalboa/rfid pattern)
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  // 2. Convert raw UID byte array into an uppercase Hex string (e.g., "A3 5B 2C 19")
+  // Inspired by Random Nerd Tutorials & How To Mechatronics UID formatting
+  String scannedUID = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      scannedUID += "0";
+    }
+    scannedUID += String(rfid.uid.uidByte[i], HEX);
+    if (i < rfid.uid.size - 1) {
+      scannedUID += " ";
+    }
+  }
+  scannedUID.toUpperCase();
+
+  // 3. Non-blocking anti-passback filter using millis()
+  if (scannedUID == lastScannedUID && (millis() - lastScanTime < scanCooldown)) {
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+  lastScannedUID = scannedUID;
+  lastScanTime = millis();
+
+  // 4. Search enrolled user database
+  int userIndex = -1;
+  for (int i = 0; i < totalUsers; i++) {
+    if (scannedUID == database[i].uid) {
+      userIndex = i;
+      break;
+    }
+  }
+
+  // 5. Process Attendance or Reject Unknown Card
+  if (userIndex != -1) {
+    processAuthorizedUser(database[userIndex]);
+  } else {
+    processUnauthorizedCard(scannedUID);
+  }
+
+  // 6. Halt card communication and stop PCD crypto so reader is ready for next tap
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// --- Helper: Authorized User Check-In / Check-Out ---
+void processAuthorizedUser(User &user) {
+  // Toggle attendance status
+  user.isCheckedIn = !user.isCheckedIn;
+  const char* action = user.isCheckedIn ? "CHECK_IN" : "CHECK_OUT";
+
+  // Output structured CSV line for Python Serial Logger
+  Serial.print(F("RECORD:"));
+  Serial.print(user.uid);
+  Serial.print(F(","));
+  Serial.print(user.name);
+  Serial.print(F(","));
+  Serial.print(user.idNumber);
+  Serial.print(F(","));
+  Serial.print(action);
+  Serial.println(F(",AUTHORIZED"));
+
+  // Hardware Feedback: Green LED + Dual-Tone Chime
+  digitalWrite(LED_GREEN, HIGH);
+  if (user.isCheckedIn) {
+    // Rising chime for Check-In
+    tone(BUZZER, 2000, 100);
+    delay(120);
+    tone(BUZZER, 2600, 150);
+  } else {
+    // Falling chime for Check-Out
+    tone(BUZZER, 2600, 100);
+    delay(120);
+    tone(BUZZER, 2000, 150);
+  }
+  delay(700);
+  digitalWrite(LED_GREEN, LOW);
+}
+
+// --- Helper: Unauthorized / Unregistered Card ---
+void processUnauthorizedCard(String uid) {
+  Serial.print(F("RECORD:"));
+  Serial.print(uid);
+  Serial.println(F(",UNKNOWN,UNREGISTERED,ATTEMPT,ACCESS_DENIED"));
+
+  // Hardware Feedback: Red LED + Low Error Buzz
+  digitalWrite(LED_RED, HIGH);
+  tone(BUZZER, 400, 500);
+  delay(600);
+  digitalWrite(LED_RED, LOW);
+}
